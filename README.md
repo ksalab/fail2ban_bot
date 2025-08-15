@@ -38,7 +38,7 @@ A Telegram bot for monitoring `fail2ban` activity: bans, statistics, service sta
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/yourusername/fail2ban_bot.git
+git clone https://github.com/ksalab/fail2ban_bot.git
 cd fail2ban_bot
 ```
 
