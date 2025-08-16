@@ -5,15 +5,16 @@
 
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
+import glob
 import geoip2.database
 import geopandas as gpd
+import httpx
 import logging
 import os
 import pandas as pd
 import re
 import subprocess
 import tarfile
-
 
 from collections import Counter
 from datetime import datetime, timedelta
@@ -33,6 +34,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+from telegram.ext import ExtBot, ApplicationBuilder
+
 
 # === Load config ===
 load_dotenv()
@@ -55,6 +58,34 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required in .env")
 if not CHAT_ID:
     raise RuntimeError("CHAT_ID is required in .env")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger = logging.getLogger(__name__)
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # (Optional) Notify admin
+    for admin_id in ADMINS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text="⚠️ The bot encountered an error. Please check the logs.",
+            )
+        except:
+            pass
+
+
+class CustomExtBot(ExtBot):
+    """ExtBot с кастомным httpx.Client для retry и таймаутов."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def create_session(self) -> httpx.Client:
+        return httpx.Client(
+            transport=httpx.HTTPTransport(retries=3),
+            timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=30.0),
+        )
 
 
 # === Periods ===
@@ -218,8 +249,9 @@ def generate_world_map_plot(ips: List[str], title: str) -> str:
         shpfilename = shpreader.natural_earth(
             resolution="110m", category="cultural", name="admin_0_countries"
         )
+
         reader = shpreader.Reader(shpfilename)
-        countries = reader.records()
+        countries = list(reader.records())
 
         # Get geo data and count by country
         geo_data = [get_geo_info(ip) for ip in ips]
@@ -961,6 +993,14 @@ def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 # === Main ===
 def main() -> None:
+    # Cleaning up old charts
+    for plot_file in glob.glob("/tmp/fail2ban_*.png"):
+        try:
+            os.unlink(plot_file)
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to remove old plot {plot_file}: {e}")
+
     setup_logging(LOG_LEVEL)
     logger = logging.getLogger(__name__)
     logger.info("--------------------------------------------------------")
@@ -970,7 +1010,10 @@ def main() -> None:
     # ✅ Update GeoIP DB on startup
     update_geoip_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    bot = CustomExtBot(token=BOT_TOKEN)
+
+    app = ApplicationBuilder().bot(bot).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
