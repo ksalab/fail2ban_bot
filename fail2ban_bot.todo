@@ -1,0 +1,114 @@
+=================================================================================
+| fail2ban Telegram Bot - TODO List
+| This file contains the current status of the bot's features and planned tasks.
+=================================================================================
+
+Features and tasks:
+
+Main commands and functionality:
+  Added the /start command:
+    ✔ Welcome message with available commands. @done(25-08-14 10:15)
+  Added the /status command:
+    ✔ Service state (running/enabled). @done(25-08-14 10:15)
+    ✔ Version and uptime (ActiveEnterTimestamp). @done(25-08-14 10:15)
+    ✔ SSH jail status via fail2ban-client. @done(25-08-14 10:15)
+  Added the /stats command:
+    ✔ Period selection (hour, day, week, month, year). @done(25-08-14 10:15)
+    ✔ Ban count and comparison with previous period. @done(25-08-14 10:15)
+    ✔ Embedded plots in messages. @done(25-08-14 10:15)
+  Added the /geo command:
+    ✔ World map of banned IPs (via CartoPy). @done(25-08-14 10:15)
+    ✔ Unique colors per country with legend. @done(25-08-14 10:15)
+    ✔ Geo stats for selected period. @done(25-08-14 10:15)
+  Security:
+    ✔ Token masking in logs (botXXX:XXX). @done(25-08-14 10:15)
+    ✔ Admin-only access via ADMINS list. @done(25-08-14 10:15)
+
+Notifications:
+  GeoIP database update notifications:
+    ✔ Telegram alert on successful update. @done(25-08-14 10:15)
+    ✔ Telegram alert on download/error. @done(25-08-14 10:15)
+  Anomaly detection (e.g., >100 bans/hour):
+    - Planned: Not implemented. Can trigger high-severity alert.
+  Scheduled reports (daily/weekly summary):
+    - Planned: Not implemented. Can be added via JobQueue.
+  Support for message_thread_id (topic in group):
+    ✔ Configurable via .env. @done(25-08-14 10:15)
+
+Data storage:
+  GeoIP database (GeoLite2-City.mmdb):
+    ✔ Auto-download on startup. @done(25-08-14 10:15)
+    ✔ Auto-update every 28 days. @done(25-08-14 10:15)
+  IP and geo data caching:
+    ✔ In-memory cache (geo_cache). @done(25-08-14 10:15)
+  Log file parsing:
+    ✔ Read from LOG_FILE path. @done(25-08-14 10:15)
+    ✔ Parse ISO and syslog timestamps. @done(25-08-14 10:15)
+  Multi-server support:
+    - Planned: Add support for monitoring multiple servers.
+    ✔ Work with multiple servers will be added, but:
+    - Chat remains single (one CHAT_ID).
+    - List of servers stored in .env (SERVERS="host1:label1,host2:label2").
+    - Log paths can be local or via log aggregation.
+    - Messages will include server IP/label for context.
+    - Implementation: Extend extract_banned_ips() to accept server context.
+
+Monitoring and inspections:
+  Ban count by time period:
+    ✔ Implemented for all fixed periods. @done(25-08-14 10:15)
+  Geo-location of banned IPs:
+    ✔ Country and city lookup via GeoIP2. @done(25-08-14 10:15)
+    ✔ Unknown city → display country. @done(25-08-14 10:15)
+  World map visualization:
+    ✔ Countries with bans → unique color. @done(25-08-14 10:15)
+    ✔ Countries without bans → white. @done(25-08-14 10:15)
+    ✔ Legend with country and count. @done(25-08-14 10:15)
+  Support for other jails (nginx, postfix, etc.):
+    - Planned: Not implemented. Can extend get_service_status() and add jail selection.
+
+Formatting and UX:
+  Button labels and icons:
+    ✔ "📈 Compare", "🌏 Geo Stats", "🔄 Select another period". @done(25-08-14 10:15)
+    ✔ Icon consistency and visual clarity. @done(25-08-14 10:15)
+  Message formatting:
+    ✔ Markdown for /status. @done(25-08-14 10:15)
+    ✔ Embedded plots with captions. @done(25-08-14 10:15)
+  Logging formatting:
+    ✔ Per-field coloring (asctime, levelname, name). @done(25-08-14 10:15)
+    ✔ Level-specific icons in logs (🟢 INFO, ⚠️ WARNING, etc.). @planned
+  Pagination for long geo lists:
+    - Planned: Not needed yet, but could be added if legend becomes too large.
+
+Logging and debugging:
+  Centralized logging:
+    ✔ Logs in fail2ban_bot.log with rotation. @done(25-08-14 10:15)
+    ✔ Console coloring by level. @done(25-08-14 10:15)
+    ✔ Suppressed httpx/urllib3 DEBUG logs. @done(25-08-14 10:15)
+  JSON logging for ELK/Splunk:
+    - Planned: Not implemented. Can be added via python-json-logger.
+  Log cleanup:
+    ✔ Remove old /tmp/*.png on startup. @planned
+    - Will prevent disk pollution.
+
+Infrastructure and dependencies:
+  Docker support:
+    ✔ Dockerfile with slim base image. @done(25-08-14 10:15)
+    ✔ Multi-stage system dependencies (libproj, libgeos). @done(25-08-14 10:15)
+    ✔ Volume mounts for logs and geoip. @done(25-08-14 10:15)
+  CI/CD pipeline:
+    - Planned: Not implemented. Can be added via GitHub Actions:
+    - Linting (ruff, mypy)
+    - Docker build and push to registry
+    - Release automation
+  Requirements management:
+    ✔ requirements.txt with pinned versions. @done(25-08-14 10:15)
+
+Release and documentation:
+  GitHub repository:
+    ✔ Initialized with .gitignore, LICENSE (MIT). @done(25-08-14 10:15)
+  README.md:
+    ✔ Comprehensive guide with setup, commands, and Docker. @done(25-08-14 10:15)
+  Versioning and release:
+    ✔ v1.0.0 released on GitHub. @done(25-08-14 10:15)
+  Project topics:
+    ✔ Added relevant GitHub topics for discoverability. @done(25-08-14 10:15)
