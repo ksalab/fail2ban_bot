@@ -3,11 +3,14 @@
 # Telegram bot for fail2ban monitoring: stats, plots, status, logs
 # ==========================================================================
 
+import aiohttp
+import asyncio
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
 import glob
 import geoip2.database
 import geopandas as gpd
+import hashlib
 import httpx
 import logging
 import os
@@ -15,8 +18,9 @@ import pandas as pd
 import re
 import subprocess
 import tarfile
+import tempfile
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
@@ -29,7 +33,6 @@ import matplotlib.pyplot as plt
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
@@ -41,6 +44,7 @@ from telegram.ext import ExtBot, ApplicationBuilder
 load_dotenv()
 
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+TMP_DIR = Path(tempfile.gettempdir())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMINS = (
@@ -62,7 +66,9 @@ if not CHAT_ID:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger = logging.getLogger(__name__)
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    logger.error(
+        f"Exception while handling update: {context.error}", exc_info=context.error
+    )
 
     # (Optional) Notify admin
     for admin_id in ADMINS:
@@ -75,17 +81,45 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-class CustomExtBot(ExtBot):
-    """ExtBot с кастомным httpx.Client для retry и таймаутов."""
+def stable_color(country_name: str) -> str:
+    """
+    Generates a fixed HEX color based on the country name.
+    """
+    # Take the SHA1 hash of the string
+    h = hashlib.sha1(country_name.encode("utf-8")).hexdigest()
+    # First 6 characters → HEX color
+    return "#" + h[:6]
 
-    def __init__(self, *args, **kwargs):
+
+class CustomExtBot(ExtBot):
+    def __init__(self, *args, retries: int = 3, retry_delay: float = 1.0, **kwargs):
+        # Сохраняем кастомные поля ДО super()
+        self._retries = retries
+        self._retry_delay = retry_delay
         super().__init__(*args, **kwargs)
 
-    def create_session(self) -> httpx.Client:
-        return httpx.Client(
-            transport=httpx.HTTPTransport(retries=3),
-            timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=30.0),
-        )
+    async def _safe_request(self, func, *args, **kwargs):
+        """Retry wrapper for all send_* methods"""
+        for attempt in range(self._retries):
+            try:
+                return await func(*args, **kwargs)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < self._retries - 1:
+                    await asyncio.sleep(
+                        self._retry_delay * (2**attempt)
+                    )  # экспоненциальная задержка
+                else:
+                    raise
+
+    def __getattr__(self, name):
+        if name.startswith("send_"):
+            orig = getattr(super(), name)
+
+            async def wrapper(*args, **kwargs):
+                return await self._safe_request(orig, *args, **kwargs)
+
+            return wrapper
+        raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
 
 # === Periods ===
@@ -131,7 +165,7 @@ class ColoredFormatter(logging.Formatter):
         color = self.COLORS.get(record.levelno, self.RESET)
         icon = self.ICONS.get(record.levelno, "❓")
 
-        asctime = f"{self.CYAN}{record.asctime}{self.RESET}"
+        asctime = f"{self.CYAN}{self.formatTime(record, self.datefmt)}{self.RESET}"
         levelname = f"{color}{icon} {record.levelname:<8}{self.RESET}"
         name = f"{self.GREY}{record.name}{self.RESET}"
 
@@ -188,13 +222,15 @@ def setup_logging(log_level: str) -> None:
 
 
 # === Geo-data cache ===
-geo_cache = {}
+MAX_CACHE_SIZE = 1000
+geo_cache = OrderedDict()
 
 
 def get_geo_info(ip: str) -> Dict[str, str]:
     """Get country and city for IP from GeoLite2 DB."""
     logger = logging.getLogger(__name__)
     if ip in geo_cache:
+        geo_cache.move_to_end(ip)
         return geo_cache[ip]
 
     try:
@@ -208,6 +244,9 @@ def get_geo_info(ip: str) -> Dict[str, str]:
         logger.debug(f"Geo lookup failed for {ip}: {e}")
 
     geo_cache[ip] = result
+    if len(geo_cache) > MAX_CACHE_SIZE:
+        geo_cache.popitem(last=False)
+
     return result
 
 
@@ -258,13 +297,7 @@ def generate_world_map_plot(ips: List[str], title: str) -> str:
         df = pd.DataFrame(geo_data)
         country_counts = df["country"].value_counts().to_dict()
 
-        # Assign unique color to each country with bans
-        import random
-
-        def random_color():
-            return [random.random() for _ in range(3)]  # RGB
-
-        country_colors = {country: random_color() for country in country_counts}
+        country_colors = {country: stable_color(country) for country in country_counts}
 
         # Set up plot
         crs = ccrs.Robinson()
@@ -317,7 +350,7 @@ def generate_world_map_plot(ips: List[str], title: str) -> str:
             )
 
         # Save
-        plot_path = "/tmp/geo_world_map.png"
+        plot_path = TMP_DIR / "geo_world_map.png"
         plt.savefig(plot_path, dpi=100, bbox_inches="tight", pad_inches=0.1)
         plt.close()
         logger.info(f"Generated world map plot: {plot_path}")
@@ -598,7 +631,7 @@ def generate_single_period_plot(hours: int, period_name: str) -> str:
     )
     plt.xticks(rotation=45, fontsize=8)
     plt.tight_layout()
-    plot_path = f"/tmp/fail2ban_current_{period_name.lower()}.png"
+    plot_path = TMP_DIR / f"fail2ban_current_{period_name.lower()}.png"
     plt.savefig(plot_path)
     plt.close()
     logger.info(f"Generated plot for {period_name}: {plot_path}")
@@ -629,7 +662,7 @@ def generate_comparison_plot(current: int, prev: int, period_name: str) -> str:
         )
 
     plt.tight_layout()
-    plot_path = f"/tmp/fail2ban_compare_{period_name.lower()}.png"
+    plot_path = TMP_DIR / f"fail2ban_compare_{period_name.lower()}.png"
     plt.savefig(plot_path)
     plt.close()
     logger.info(f"Generated comparison plot: {plot_path}")
@@ -772,7 +805,13 @@ async def compare_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     diff = current - prev
     trend = "↗️" if diff > 0 else "↘️" if diff < 0 else "➡️"
     change = abs(diff)
-    percent = (change / (prev or 1)) * 100
+    if prev == 0:
+        if current == 0:
+            percent = 0.0  # no changes
+        else:
+            percent = 100.0  # all new, none of the previous ones were there
+    else:
+        percent = (change / prev) * 100
     text += f"📈 Change: {trend} {change} ({percent:.1f}%)\n"
 
     plot_path = generate_comparison_plot(current, prev, label)
@@ -858,7 +897,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # === Update GeoIP db ===
-def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
+async def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
     """Automatically update GeoLite2-City.mmdb if older than 28 days and notify via Telegram."""
     logger = logging.getLogger(__name__)
 
@@ -965,13 +1004,13 @@ def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
             tar_path.unlink()
 
 
-def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Send alert to configured chat/thread. Uses context.bot if available, else creates temporary app."""
     logger = logging.getLogger(__name__)
     try:
         if context and context.bot:
             # Normal case: called during bot runtime
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"📦 GeoIP Update\n\n{text}",
                 message_thread_id=THREAD_ID,
@@ -981,7 +1020,7 @@ def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
             from telegram import Bot
 
             bot = Bot(token=BOT_TOKEN)
-            bot.send_message(
+            await bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"📦 GeoIP Update\n\n{text}",
                 message_thread_id=THREAD_ID,
@@ -992,9 +1031,9 @@ def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 # === Main ===
-def main() -> None:
+async def main() -> None:
     # Cleaning up old charts
-    for plot_file in glob.glob("/tmp/fail2ban_*.png"):
+    for plot_file in TMP_DIR.glob("fail2ban_*.png"):
         try:
             os.unlink(plot_file)
         except Exception as e:
@@ -1008,9 +1047,9 @@ def main() -> None:
     logger.info("--------------------------------------------------------")
 
     # ✅ Update GeoIP DB on startup
-    update_geoip_db()
+    await update_geoip_db()
 
-    bot = CustomExtBot(token=BOT_TOKEN)
+    bot = CustomExtBot(token=BOT_TOKEN, retries=5, retry_delay=2)
 
     app = ApplicationBuilder().bot(bot).build()
     app.add_error_handler(error_handler)
@@ -1027,8 +1066,8 @@ def main() -> None:
     )
 
     logger.info("Bot is running. Awaiting updates...")
-    app.run_polling()
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
