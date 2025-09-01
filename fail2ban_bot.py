@@ -1,17 +1,14 @@
 # ==========================================================================
-# fail2ban_bot.py
-# Telegram bot for fail2ban monitoring: stats, plots, status, logs
+# fail2ban_bot_aiogram.py
+# Telegram bot (aiogram v3.22) for fail2ban monitoring: stats, plots, status, logs
 # ==========================================================================
 
-import aiohttp
 import asyncio
+import aiohttp
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
-import glob
 import geoip2.database
-import geopandas as gpd
 import hashlib
-import httpx
 import logging
 import os
 import pandas as pd
@@ -20,8 +17,9 @@ import subprocess
 import tarfile
 import tempfile
 
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from datetime import datetime, timedelta
+from dateutil import parser
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -31,14 +29,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
+# === aiogram v3.22 ===
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    FSInputFile,
 )
-from telegram.ext import ExtBot, ApplicationBuilder
-
 
 # === Load config ===
 load_dotenv()
@@ -50,7 +52,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMINS = (
     list(map(int, os.getenv("ADMINS", "").split(","))) if os.getenv("ADMINS") else []
 )
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = int(os.getenv("CHAT_ID")) if os.getenv("CHAT_ID") else None
 MESSAGE_THREAD_ID = os.getenv("MESSAGE_THREAD_ID")
 LOG_FILE_PATH = os.getenv("LOG_FILE", "/var/log/fail2ban.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -60,67 +62,8 @@ THREAD_ID = int(MESSAGE_THREAD_ID) if MESSAGE_THREAD_ID else None
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required in .env")
-if not CHAT_ID:
+if CHAT_ID is None:
     raise RuntimeError("CHAT_ID is required in .env")
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger = logging.getLogger(__name__)
-    logger.error(
-        f"Exception while handling update: {context.error}", exc_info=context.error
-    )
-
-    # (Optional) Notify admin
-    for admin_id in ADMINS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text="⚠️ The bot encountered an error. Please check the logs.",
-            )
-        except:
-            pass
-
-
-def stable_color(country_name: str) -> str:
-    """
-    Generates a fixed HEX color based on the country name.
-    """
-    # Take the SHA1 hash of the string
-    h = hashlib.sha1(country_name.encode("utf-8")).hexdigest()
-    # First 6 characters → HEX color
-    return "#" + h[:6]
-
-
-class CustomExtBot(ExtBot):
-    def __init__(self, *args, retries: int = 3, retry_delay: float = 1.0, **kwargs):
-        # Сохраняем кастомные поля ДО super()
-        self._retries = retries
-        self._retry_delay = retry_delay
-        super().__init__(*args, **kwargs)
-
-    async def _safe_request(self, func, *args, **kwargs):
-        """Retry wrapper for all send_* methods"""
-        for attempt in range(self._retries):
-            try:
-                return await func(*args, **kwargs)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt < self._retries - 1:
-                    await asyncio.sleep(
-                        self._retry_delay * (2**attempt)
-                    )  # экспоненциальная задержка
-                else:
-                    raise
-
-    def __getattr__(self, name):
-        if name.startswith("send_"):
-            orig = getattr(super(), name)
-
-            async def wrapper(*args, **kwargs):
-                return await self._safe_request(orig, *args, **kwargs)
-
-            return wrapper
-        raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
-
 
 # === Periods ===
 PERIODS = {
@@ -133,9 +76,8 @@ PERIODS = {
 }
 
 
-# === Logging setup with per-field coloring ===
+# === Logging with per-field coloring ===
 class ColoredFormatter(logging.Formatter):
-    # ANSI colors
     CYAN = "\x1b[36m"
     MAGENTA = "\x1b[35m"
     GREY = "\x1b[38;5;242m"
@@ -169,10 +111,7 @@ class ColoredFormatter(logging.Formatter):
         levelname = f"{color}{icon} {record.levelname:<8}{self.RESET}"
         name = f"{self.GREY}{record.name}{self.RESET}"
 
-        # === 🔒 Masking the token in the message ===
-        message = (
-            record.getMessage()
-        )  # This is already a string with substituted arguments
+        message = record.getMessage()
         message = re.sub(r"bot\d+:[\w-]+", "botXXX:XXX", message)
 
         formatted = f"{asctime} | {levelname} | {name}: {message}"
@@ -185,7 +124,6 @@ class ColoredFormatter(logging.Formatter):
 
 
 def setup_logging(log_level: str) -> None:
-    """Configure root logger to capture all logs with module names and colored output."""
     log_levels = {
         "DEBUG": logging.DEBUG,
         "INFO": logging.INFO,
@@ -194,16 +132,13 @@ def setup_logging(log_level: str) -> None:
     }
     level = log_levels.get(log_level.upper(), logging.INFO)
 
-    # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
 
-    # Remove existing handlers
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
 
-    # File handler — no colors
-    file_handler = logging.FileHandler("fail2ban_bot.log")
+    file_handler = logging.FileHandler(LOG_FILE_PATH)
     file_formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s: %(message)s",
         datefmt=DATE_FORMAT,
@@ -211,7 +146,6 @@ def setup_logging(log_level: str) -> None:
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
 
-    # Console handler — with colors
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(ColoredFormatter("", datefmt=DATE_FORMAT))
     console_handler.setLevel(level)
@@ -221,13 +155,25 @@ def setup_logging(log_level: str) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
-# === Geo-data cache ===
+# === Helpers / cache ===
 MAX_CACHE_SIZE = 1000
 geo_cache = OrderedDict()
 
 
+def is_user_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+
+async def safe_delete_message(query: CallbackQuery):
+    logger = logging.getLogger(__name__)
+    try:
+        if query.message:
+            await query.message.delete()
+    except Exception as e:
+        logger.debug(f"Failed to delete message: {e}")
+
+
 def get_geo_info(ip: str) -> Dict[str, str]:
-    """Get country and city for IP from GeoLite2 DB."""
     logger = logging.getLogger(__name__)
     if ip in geo_cache:
         geo_cache.move_to_end(ip)
@@ -246,248 +192,78 @@ def get_geo_info(ip: str) -> Dict[str, str]:
     geo_cache[ip] = result
     if len(geo_cache) > MAX_CACHE_SIZE:
         geo_cache.popitem(last=False)
-
     return result
 
 
+def stable_color(country_name: str) -> str:
+    h = hashlib.sha1(country_name.encode("utf-8")).hexdigest()
+    return "#" + h[:6]
+
+
+def parse_log_timestamp(log_line: str) -> Optional[datetime]:
+    iso_match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?", log_line)
+    if iso_match:
+        ts_str = iso_match.group(1)
+        try:
+            return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to parse timestamp (ISO basic)")
+
+    iso8601_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z?", log_line)
+    if iso8601_match:
+        ts_str = iso8601_match.group(1)
+        try:
+            return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to parse timestamp (ISO8601)")
+    return None
+
+
 def extract_banned_ips(since_hours: int = None) -> List[str]:
-    """Extract all banned IPs from log file in the last N hours."""
+    """
+    Extract unique banned IP addresses from fail2ban log.
+
+    Args:
+        since_hours (int, optional): If set, only include bans within the last N hours.
+
+    Returns:
+        List[str]: List of unique banned IP addresses.
+    """
     logger = logging.getLogger(__name__)
     ips = []
     now = datetime.now()
     if since_hours:
         cutoff = now - timedelta(hours=since_hours)
-
     try:
         with open(LOG_FILE_PATH, "r") as f:
             for line in f:
                 if "Ban " not in line:
                     continue
-                # Searching for IP after "Ban"
-                match = re.search(r"Ban (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
-                if not match:
+                m = re.search(
+                    r"Ban ([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)", line
+                )
+                if not m:
                     continue
-                ip = match.group(1)
+                ip = m.group(1)
                 ts = parse_log_timestamp(line)
                 if since_hours and ts and ts < cutoff:
                     continue
                 ips.append(ip)
     except Exception as e:
         logger.error(f"Error reading banned IPs: {e}")
-    return ips
-
-
-def generate_world_map_plot(ips: List[str], title: str) -> str:
-    """Generate a world map with unique colors for countries that have banned IPs."""
-    logger = logging.getLogger(__name__)
-    if not ips:
-        return None
-
-    try:
-        # Load country geometries
-        shpfilename = shpreader.natural_earth(
-            resolution="110m", category="cultural", name="admin_0_countries"
-        )
-
-        reader = shpreader.Reader(shpfilename)
-        countries = list(reader.records())
-
-        # Get geo data and count by country
-        geo_data = [get_geo_info(ip) for ip in ips]
-        df = pd.DataFrame(geo_data)
-        country_counts = df["country"].value_counts().to_dict()
-
-        country_colors = {country: stable_color(country) for country in country_counts}
-
-        # Set up plot
-        crs = ccrs.Robinson()
-        fig, ax = plt.subplots(1, 1, figsize=(15, 8), subplot_kw={"projection": crs})
-        ax.set_global()
-
-        # Draw countries
-        for country in countries:
-            name = country.attributes["NAME"]
-            geom = country.geometry
-
-            if name in country_counts:
-                count = country_counts[name]
-                color = country_colors[name]
-                label = f"{name}: {count}"
-                ax.add_geometries(
-                    [geom],
-                    crs=ccrs.PlateCarree(),
-                    facecolor=color,
-                    edgecolor="black",
-                    linewidth=0.2,
-                    label=label,
-                )
-            else:
-                ax.add_geometries(
-                    [geom],
-                    crs=ccrs.PlateCarree(),
-                    facecolor="white",
-                    edgecolor="black",
-                    linewidth=0.2,
-                )
-
-        plt.title(title, fontsize=14, pad=20)
-
-        # Add legend (only for countries with bans)
-        from matplotlib.patches import Patch
-
-        legend_patches = [
-            Patch(facecolor=country_colors[country], label=f"{country} ({count})")
-            for country, count in country_counts.items()
-        ]
-        if legend_patches:
-            ax.legend(
-                handles=legend_patches,
-                loc="lower left",
-                fontsize=8,
-                frameon=True,
-                title="Countries with bans",
-                title_fontsize=9,
-            )
-
-        # Save
-        plot_path = TMP_DIR / "geo_world_map.png"
-        plt.savefig(plot_path, dpi=100, bbox_inches="tight", pad_inches=0.1)
-        plt.close()
-        logger.info(f"Generated world map plot: {plot_path}")
-        return plot_path
-
-    except Exception as e:
-        logger.error(f"Failed to generate world map: {e}")
-        return None
-
-
-async def geo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send global geo stats: world map only."""
-    logger = logging.getLogger(__name__)
-    if not is_user_admin(update.effective_user.id):
-        await update.message.reply_text("Access denied.")
-        return
-
-    logger.info("User requested global geo stats")
-    ips = extract_banned_ips()  # all time
-
-    if not ips:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="No banned IPs found.",
-            message_thread_id=THREAD_ID,
-        )
-        return
-
-    # Generate world map
-    map_plot = generate_world_map_plot(
-        ips, "Global Distribution of Banned IPs — All Time"
-    )
-    if map_plot:
-        with open(map_plot, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=photo,
-                caption="🌍 Geographic distribution of banned IPs — All Time",
-                message_thread_id=THREAD_ID,
-            )
-    else:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Failed to generate world map.",
-            message_thread_id=THREAD_ID,
-        )
-
-    # Add button to open period selection
-    reply_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🗺️ View by Period", callback_data="stats_menu")]]
-    )
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text="Or select a period to view detailed stats:",
-        reply_markup=reply_markup,
-        message_thread_id=THREAD_ID,
-    )
-
-
-async def geo_for_period_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Send geo stats for the selected period — world map only."""
-    logger = logging.getLogger(__name__)
-    query = update.callback_query
-    await query.answer()
-
-    period_key = query.data.replace("geo_period_", "")
-    if period_key not in PERIODS:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Invalid period.",
-            message_thread_id=THREAD_ID,
-        )
-        return
-
-    hours, label = PERIODS[period_key]
-    logger.info(f"User requested geo stats for period: {label} ({hours}h)")
-
-    ips = extract_banned_ips(since_hours=hours)
-    if not ips:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"No banned IPs found in the last {label.lower()}.",
-            message_thread_id=THREAD_ID,
-        )
-        return
-
-    # Only world map
-    map_plot = generate_world_map_plot(
-        ips, f"Global Distribution of Banned IPs — Last {label.lower()}"
-    )
-    if map_plot:
-        with open(map_plot, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=photo,
-                caption=f"🌍 Geographic distribution — Last {label.lower()}",
-                message_thread_id=THREAD_ID,
-            )
-    else:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Failed to generate world map.",
-            message_thread_id=THREAD_ID,
-        )
-
-    # Back button
-    reply_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Back to Periods", callback_data="stats_menu")]]
-    )
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text="📅 Select another period:",
-        reply_markup=reply_markup,
-        message_thread_id=THREAD_ID,
-    )
-
-    await query.delete_message()
-
-
-# === Helpers ===
-def is_user_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
-
-def parse_log_timestamp(log_line: str) -> Optional[datetime]:
-    iso_match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", log_line)
-    if iso_match:
-        try:
-            return datetime.strptime(iso_match.group(1), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            pass
-    return None
+    return list(set(ips))
 
 
 def count_bans_in_period(hours: int) -> int:
+    """
+    Count the number of bans in the last given hours.
+
+    Args:
+        hours (int): Number of hours to look back.
+
+    Returns:
+        int: Number of bans in the period.
+    """
     logger = logging.getLogger(__name__)
     now = datetime.now()
     cutoff = now - timedelta(hours=hours)
@@ -499,6 +275,8 @@ def count_bans_in_period(hours: int) -> int:
             if "Ban" not in line:
                 continue
             ts = parse_log_timestamp(line)
+            if ts is None:
+                continue
             if ts and ts >= cutoff:
                 count += 1
             elif ts and ts < cutoff:
@@ -510,6 +288,21 @@ def count_bans_in_period(hours: int) -> int:
 
 
 def get_service_status() -> Dict[str, str]:
+    """
+    Retrieve fail2ban service information.
+
+    Returns:
+        Dict[str, str]: Dictionary containing:
+            - running (bool): Whether the service is active.
+            - enabled (bool): Whether the service starts on boot.
+            - version (str): fail2ban version.
+            - start_time (str): Timestamp of last service start.
+            - sshd_status (str): Status of sshd jail.
+
+    Notes:
+        Multiple subprocess calls are wrapped in try/except to ensure
+        that failure in one part doesn't break the entire function.
+    """
     logger = logging.getLogger(__name__)
     try:
         active = (
@@ -537,10 +330,9 @@ def get_service_status() -> Dict[str, str]:
         result = subprocess.run(
             ["fail2ban-client", "status", "sshd"], capture_output=True, text=True
         )
-        if result.returncode == 0:
-            sshd_status = result.stdout
-        else:
-            sshd_status = "Could not get sshd status"
+        sshd_status = (
+            result.stdout if result.returncode == 0 else "Could not get sshd status"
+        )
     except Exception as e:
         logger.error(f"Failed to run fail2ban-client status sshd: {e}")
         sshd_status = "Error retrieving status"
@@ -565,14 +357,11 @@ def get_service_status() -> Dict[str, str]:
         line = result.stdout.strip()
         if "ActiveEnterTimestamp=" in line:
             ts_str = line.split("=", 1)[1]
-            match = re.search(r"\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", ts_str)
-            if match:
-                start_time = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+            try:
+                start_time = parser.parse(ts_str)
                 start_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
-            else:
+            except Exception:
                 start_str = "Unknown"
-        else:
-            start_str = "Unknown"
     except Exception as e:
         logger.error(f"Failed to get start time: {e}")
         start_str = "Unknown"
@@ -590,13 +379,22 @@ def get_service_status() -> Dict[str, str]:
 
 
 def generate_single_period_plot(hours: int, period_name: str) -> str:
+    """
+    Generate a bar plot showing number of bans per interval within a period.
+
+    Args:
+        hours (int): Total number of hours to include.
+        period_name (str): Label for the period (used in file name and title).
+
+    Returns:
+        str: Path to the saved PNG plot.
+    """
     logger = logging.getLogger(__name__)
     now = datetime.now()
     buckets = min(20, hours) if hours <= 24 else 15
     interval = timedelta(seconds=(hours * 3600) // buckets)
     current = now - timedelta(hours=hours)
-    times = []
-    counts = []
+    times, counts = [], []
 
     while current < now:
         next_t = current + interval
@@ -635,10 +433,21 @@ def generate_single_period_plot(hours: int, period_name: str) -> str:
     plt.savefig(plot_path)
     plt.close()
     logger.info(f"Generated plot for {period_name}: {plot_path}")
-    return plot_path
+    return str(plot_path)
 
 
 def generate_comparison_plot(current: int, prev: int, period_name: str) -> str:
+    """
+    Generate a comparison bar plot between current and previous period bans.
+
+    Args:
+        current (int): Number of bans in current period.
+        prev (int): Number of bans in previous period.
+        period_name (str): Label for period (used in file name and title).
+
+    Returns:
+        str: Path to the saved PNG plot.
+    """
     logger = logging.getLogger(__name__)
     plt.figure(figsize=(6, 4))
     bars = plt.bar(
@@ -649,263 +458,154 @@ def generate_comparison_plot(current: int, prev: int, period_name: str) -> str:
     )
     plt.title(f"Comparison: {period_name}")
     plt.ylabel("Bans")
-
     for bar in bars:
-        height = bar.get_height()
+        h = bar.get_height()
         plt.text(
             bar.get_x() + bar.get_width() / 2,
-            height + max(height * 0.05, 1),
-            f"{int(height)}",
+            h + max(h * 0.05, 1),
+            f"{int(h)}",
             ha="center",
             va="bottom",
             fontsize=10,
         )
-
     plt.tight_layout()
     plot_path = TMP_DIR / f"fail2ban_compare_{period_name.lower()}.png"
     plt.savefig(plot_path)
     plt.close()
     logger.info(f"Generated comparison plot: {plot_path}")
-    return plot_path
+    return str(plot_path)
 
 
-# === Handlers ===
+def generate_world_map_plot(ips: List[str], title: str) -> Optional[str]:
+    """
+    Generate a world map highlighting countries with banned IPs.
+
+    Args:
+        ips (List[str]): List of IP addresses to geolocate.
+        title (str): Plot title.
+
+    Returns:
+        Optional[str]: Path to the saved PNG plot, or None if generation failed.
+    """
+    logger = logging.getLogger(__name__)
+    if not ips:
+        return None
+    try:
+        shpfilename = shpreader.natural_earth(
+            resolution="110m", category="cultural", name="admin_0_countries"
+        )
+        reader = shpreader.Reader(shpfilename)
+        countries = list(reader.records())
+
+        geo_data = [get_geo_info(ip) for ip in ips]
+        df = pd.DataFrame(geo_data)
+        country_counts = df["country"].value_counts().to_dict()
+        country_colors = {country: stable_color(country) for country in country_counts}
+
+        crs = ccrs.Robinson()
+        fig, ax = plt.subplots(1, 1, figsize=(15, 8), subplot_kw={"projection": crs})
+        ax.set_global()
+
+        for country in countries:
+            name = country.attributes["NAME"]
+            geom = country.geometry
+            if name in country_counts:
+                count = country_counts[name]
+                color = country_colors[name]
+                label = f"{name}: {count}"
+                ax.add_geometries(
+                    [geom],
+                    crs=ccrs.PlateCarree(),
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.2,
+                    label=label,
+                )
+            else:
+                ax.add_geometries(
+                    [geom],
+                    crs=ccrs.PlateCarree(),
+                    facecolor="white",
+                    edgecolor="black",
+                    linewidth=0.2,
+                )
+
+        plt.title(title, fontsize=14, pad=20)
+
+        from matplotlib.patches import Patch
+
+        legend_patches = [
+            Patch(facecolor=country_colors[country], label=f"{country} ({count})")
+            for country, count in country_counts.items()
+        ]
+        if legend_patches:
+            ax.legend(
+                handles=legend_patches,
+                loc="lower left",
+                fontsize=8,
+                frameon=True,
+                title="Countries with bans",
+                title_fontsize=9,
+            )
+
+        plot_path = TMP_DIR / "geo_world_map.png"
+        plt.savefig(plot_path, dpi=100, bbox_inches="tight", pad_inches=0.1)
+        plt.close()
+        logger.info(f"Generated world map plot: {plot_path}")
+        return str(plot_path)
+    except Exception as e:
+        logger.error(f"Failed to generate world map: {e}")
+        return None
+
+
 def get_period_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(label, callback_data=f"period_{key}")]
+        [InlineKeyboardButton(text=label, callback_data=f"period_{key}")]
         for key, (_, label) in PERIODS.items()
     ]
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# === Alerts / DB update (adapted to aiogram: use bot directly) ===
+async def _send_telegram_alert(bot: Bot, text: str) -> None:
     logger = logging.getLogger(__name__)
-    if not is_user_admin(update.effective_user.id):
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, text="Access denied."
-        )
-        return
-    logger.info(f"User {update.effective_user.id} started the bot")
-    text = (
-        "📊 Welcome to fail2ban Monitor Bot!\n\n"
-        "Available commands:\n"
-        "• /stats — view ban statistics\n"
-        "• /status — check service state\n"
-        "• /geo — view global geo stats"
-    )
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text=text,
-        message_thread_id=THREAD_ID,
-    )
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger = logging.getLogger(__name__)
-    if not is_user_admin(update.effective_user.id):
-        await update.message.reply_text("Access denied.")
-        return
-    logger.info(f"User {update.effective_user.id} opened stats menu")
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text="📊 Select period:",
-        reply_markup=get_period_keyboard(),
-        message_thread_id=THREAD_ID,
-    )
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle period selection for ban stats and trigger geo."""
-    logger = logging.getLogger(__name__)
-    query = update.callback_query
-    await query.answer()
-
-    period_key = query.data.replace("period_", "")
-    if period_key not in PERIODS:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Invalid period.",
-            message_thread_id=THREAD_ID,
-        )
-        return
-
-    hours, label = PERIODS[period_key]
-    logger.info(f"User requested stats for period: {label} ({hours}h)")
-    current = count_bans_in_period(hours)
-    plot_path = generate_single_period_plot(hours, label)
-
-    # Button: geo for this period
-    reply_markup = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"📈 Compare with previous {label.lower()}",
-                    callback_data=f"compare_{period_key}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🌏 Geo Stats for This Period",
-                    callback_data=f"geo_period_{period_key}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📅 Select another period", callback_data="stats_menu"
-                )
-            ],
-        ]
-    )
-
-    text = f"Bans in the last {label.lower()}:\n\n"
-    text += f"Total: {current}\n"
-    text += f"Period: {label}"
-
     try:
-        with open(plot_path, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=photo,
-                caption=text,
-                reply_markup=reply_markup,
-                message_thread_id=THREAD_ID,
-            )
-        await query.delete_message()
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"📦 GeoIP Update\n\n{text}",
+            message_thread_id=THREAD_ID,
+        )
+        logger.info("Sent GeoIP update notification to Telegram.")
     except Exception as e:
-        logger.error(f"Failed to send stats with plot: {e}")
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"{text}\n\nCould not generate plot.",
-            reply_markup=reply_markup,
-            message_thread_id=THREAD_ID,
-        )
+        logger.error(f"Failed to send Telegram alert: {e}")
 
 
-async def compare_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def download_geoip(url: str, dest_path: Path):
     logger = logging.getLogger(__name__)
-    query = update.callback_query
-    await query.answer()
-    period_key = query.data.replace("compare_", "")
-    if period_key not in PERIODS:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Invalid period.",
-            message_thread_id=THREAD_ID,
-        )
-        return
-
-    hours, label = PERIODS[period_key]
-    logger.info(f"User requested comparison for: {label}")
-    current = count_bans_in_period(hours)
-    prev = count_bans_in_period(2 * hours) - current
-
-    text = f"📊 Comparison: {label} vs Previous {label}\n\n"
-    text += f"📌 Current: {current}\n"
-    text += f"📌 Previous: {prev}\n"
-    diff = current - prev
-    trend = "↗️" if diff > 0 else "↘️" if diff < 0 else "➡️"
-    change = abs(diff)
-    if prev == 0:
-        if current == 0:
-            percent = 0.0  # no changes
-        else:
-            percent = 100.0  # all new, none of the previous ones were there
-    else:
-        percent = (change / prev) * 100
-    text += f"📈 Change: {trend} {change} ({percent:.1f}%)\n"
-
-    plot_path = generate_comparison_plot(current, prev, label)
-    reply_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📅 Select another period", callback_data="stats_menu")]]
-    )
-
     try:
-        with open(plot_path, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=photo,
-                caption=text,
-                reply_markup=reply_markup,
-                message_thread_id=THREAD_ID,
-            )
-        await query.delete_message()
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    while True:
+                        chunk = await resp.content.read(1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+        logger.info(f"Downloaded GeoIP DB to {dest_path}")
     except Exception as e:
-        logger.error(f"Failed to send comparison: {e}")
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            reply_markup=reply_markup,
-            message_thread_id=THREAD_ID,
-        )
+        logger.error(f"Failed to download GeoIP DB: {e}")
+        raise
 
 
-async def stats_menu_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    logger = logging.getLogger(__name__)
-    query = update.callback_query
-    await query.answer()
-    logger.info("User opened period selection menu")
-    try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="📊 Select period:",
-            reply_markup=get_period_keyboard(),
-            message_thread_id=THREAD_ID,
-        )
-        await query.delete_message()
-    except Exception as e:
-        logger.error(f"Failed to send period menu: {e}")
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="Failed to open menu. Use /stats.",
-            message_thread_id=THREAD_ID,
-        )
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger = logging.getLogger(__name__)
-    if not is_user_admin(update.effective_user.id):
-        await update.message.reply_text("Access denied.")
-        return
-    logger.info(f"User {update.effective_user.id} requested service status")
-    status = get_service_status()
-
-    running_emoji = "🟢" if status["running"] else "🔴"
-    enabled_emoji = "🟢" if status["enabled"] else "🔴"
-
-    text = "🛡️ *fail2ban Service Status*\n\n"
-    text += f"🟢 Running: {running_emoji}\n"
-    text += f"🔧 Enabled: {enabled_emoji}\n"
-    text += f"📦 Version: {status['version']}\n"
-    text += f"⏱️ Started at: {status['start_time']}\n\n"
-    text += f"🔐 *SSH Jail Status*:\n"
-    text += f"```\n{status['sshd_status']}\n```\n"
-
-    reply_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📅 Select another period", callback_data="stats_menu")]]
-    )
-
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-        message_thread_id=THREAD_ID,
-    )
-    logger.info("Sent service status to chat")
-
-
-# === Update GeoIP db ===
-async def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
-    """Automatically update GeoLite2-City.mmdb if older than 28 days and notify via Telegram."""
+async def update_geoip_db(bot: Bot | None = None) -> None:
     logger = logging.getLogger(__name__)
 
     db_path = Path(GEOIP_DB_PATH)
     db_dir = db_path.parent
     db_dir.mkdir(exist_ok=True)
 
-    # Check if DB exists and is outdated
     if db_path.exists():
         mtime = datetime.fromtimestamp(db_path.stat().st_mtime)
         if datetime.now() - mtime < timedelta(days=28):
@@ -923,55 +623,44 @@ async def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
     license_key = os.getenv("MAXMIND_LICENSE_KEY")
 
     if not account_id or not license_key:
-        error_msg = (
-            "❌ GeoIP update failed: MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY not set"
-        )
+        error_msg = "❌ GeoIP update failed: MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY not set. GeoIP update skipped."
         logger.error(error_msg)
-        _send_telegram_alert(context, error_msg + "\nPlease check .env file.")
+        if bot:
+            await _send_telegram_alert(bot, error_msg + "\nPlease check .env file.")
         return
 
-    # URLs and paths
     url = (
         f"https://download.maxmind.com/app/geoip_download"
         f"?edition_id=GeoLite2-City"
         f"&license_key={license_key}"
-        f"&product_id=GeoLite2-City"
         f"&suffix=tar.gz"
     )
     tar_path = db_dir / "GeoLite2-City.tar.gz"
 
-    # Download with curl
     try:
         logger.info("Downloading GeoLite2-City database with curl...")
-        result = subprocess.run(
-            ["curl", "-f", "-L", "-o", str(tar_path), url],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        result.check_returncode()
-        logger.info("Download completed.")
+        await download_geoip(url, tar_path)
     except subprocess.CalledProcessError as e:
         error_msg = f"❌ Download failed: {e.stderr.strip()}"
         logger.error(error_msg)
-        _send_telegram_alert(context, error_msg)
+        if bot:
+            await _send_telegram_alert(bot, error_msg)
         if tar_path.exists():
             tar_path.unlink()
         return
     except Exception as e:
         error_msg = f"❌ Unexpected error during download: {str(e)}"
         logger.error(error_msg)
-        _send_telegram_alert(context, error_msg)
+        if bot:
+            await _send_telegram_alert(bot, error_msg)
         return
 
-    # Extract the .mmdb file
     try:
         logger.info("Extracting GeoLite2-City.mmdb from archive...")
         extracted = False
         with tarfile.open(tar_path, "r:gz") as tar:
             for member in tar.getmembers():
                 if member.name.endswith(".mmdb"):
-                    # Extract and rename to target
                     member.name = db_path.name
                     tar.extract(member, path=db_dir)
                     extracted = True
@@ -980,93 +669,449 @@ async def update_geoip_db(context: ContextTypes.DEFAULT_TYPE = None) -> None:
         if not extracted:
             error_msg = "❌ No .mmdb file found in archive"
             logger.error(error_msg)
-            _send_telegram_alert(context, error_msg)
+            if bot:
+                await _send_telegram_alert(bot, error_msg)
             tar_path.unlink()
             return
 
-        tar_path.unlink()  # Clean up archive
+        tar_path.unlink()
         logger.info("GeoIP database updated successfully.")
 
-        # ✅ Send success message
         success_msg = (
             f"{update_type}\n"
             f"{body}\n"
             f"✅ Successfully downloaded and installed new GeoIP database.\n"
             f"🔍 Next check in ~28 days."
         )
-        _send_telegram_alert(context, success_msg)
+        if bot:
+            await _send_telegram_alert(bot, success_msg)
 
     except Exception as e:
         error_msg = f"❌ Extraction failed: {str(e)}"
         logger.error(error_msg)
-        _send_telegram_alert(context, error_msg)
+        if bot:
+            await _send_telegram_alert(bot, error_msg)
         if tar_path.exists():
             tar_path.unlink()
 
 
-async def _send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Send alert to configured chat/thread. Uses context.bot if available, else creates temporary app."""
+# === Handlers (aiogram) ===
+async def start(message: Message, bot: Bot):
     logger = logging.getLogger(__name__)
-    try:
-        if context and context.bot:
-            # Normal case: called during bot runtime
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"📦 GeoIP Update\n\n{text}",
-                message_thread_id=THREAD_ID,
-            )
-        else:
-            # Fallback: standalone call (e.g. from script)
-            from telegram import Bot
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_user_admin(user_id):
+        await message.answer("Access denied.")
+        return
+    logger.info(f"User {user_id} started the bot")
+    text = (
+        "📊 Welcome to fail2ban Monitor Bot!\n\n"
+        "Available commands:\n"
+        "• /stats — view ban statistics\n"
+        "• /status — check service state\n"
+        "• /geo — view global geo stats"
+    )
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text=text,
+        message_thread_id=THREAD_ID,
+    )
 
-            bot = Bot(token=BOT_TOKEN)
-            await bot.send_message(
+
+async def stats_command(message: Message, bot: Bot):
+    logger = logging.getLogger(__name__)
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_user_admin(user_id):
+        await message.answer("Access denied.")
+        return
+    logger.info(f"User {user_id} opened stats menu")
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="📊 Select period:",
+        reply_markup=get_period_keyboard(),
+        message_thread_id=THREAD_ID,
+    )
+
+
+async def status_command(message: Message, bot: Bot):
+    logger = logging.getLogger(__name__)
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_user_admin(user_id):
+        await message.answer("Access denied.")
+        return
+    logger.info(f"User {user_id} requested service status")
+    status = get_service_status()
+
+    running_emoji = "🟢" if status["running"] else "🔴"
+    enabled_emoji = "🟢" if status["enabled"] else "🔴"
+
+    text = "🛡️ *fail2ban Service Status*\n\n"
+    text += f"🟢 Running: {running_emoji}\n"
+    text += f"🔧 Enabled: {enabled_emoji}\n"
+    text += f"📦 Version: {status['version']}\n"
+    text += f"⏱️ Started at: {status['start_time']}\n\n"
+    text += f"🔐 *SSH Jail Status*:\n"
+    text += f"```\n{status['sshd_status']}\n```\n"
+
+    reply_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 Select another period", callback_data="stats_menu"
+                )
+            ]
+        ]
+    )
+
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        message_thread_id=THREAD_ID,
+    )
+    logger.info("Sent service status to chat")
+
+
+async def geo_command(message: Message, bot: Bot):
+    logger = logging.getLogger(__name__)
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_user_admin(user_id):
+        await message.answer("Access denied.")
+        return
+
+    logger.info("User requested global geo stats")
+    ips = extract_banned_ips()  # all time
+
+    if not ips:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="No banned IPs found.",
+            message_thread_id=THREAD_ID,
+        )
+        return
+
+    map_plot = generate_world_map_plot(
+        ips, "Global Distribution of Banned IPs — All Time"
+    )
+    if map_plot and Path(map_plot).exists():
+        photo = FSInputFile(str(map_plot))
+        await bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=photo,
+            caption="🌍 Geographic distribution of banned IPs — All Time",
+            message_thread_id=THREAD_ID,
+        )
+    else:
+        logger.error(f"Map file not found: {map_plot}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Failed to generate world map.",
+            message_thread_id=THREAD_ID,
+        )
+
+    reply_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗺️ View by Period", callback_data="stats_menu")]
+        ]
+    )
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="Or select a period to view detailed stats:",
+        reply_markup=reply_markup,
+        message_thread_id=THREAD_ID,
+    )
+
+
+async def stats_menu_callback(query: CallbackQuery, bot: Bot):
+    logger = logging.getLogger(__name__)
+    await query.answer()
+    logger.info("User opened period selection menu")
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="📊 Select period:",
+            reply_markup=get_period_keyboard(),
+            message_thread_id=THREAD_ID,
+        )
+        await safe_delete_message(query)
+    except Exception as e:
+        logger.error(f"Failed to send period menu: {e}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Failed to open menu. Use /stats.",
+            message_thread_id=THREAD_ID,
+        )
+
+
+async def button_callback(query: CallbackQuery, bot: Bot):
+    logger = logging.getLogger(__name__)
+    await query.answer()
+
+    if not query.data or not query.data.startswith("period_"):
+        return
+
+    period_key = query.data.replace("period_", "")
+    if period_key not in PERIODS:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Invalid period.",
+            message_thread_id=THREAD_ID,
+        )
+        return
+
+    hours, label = PERIODS[period_key]
+    logger.info(f"User requested stats for period: {label} ({hours}h)")
+    current = count_bans_in_period(hours)
+    plot_path = generate_single_period_plot(hours, label)
+
+    reply_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"📈 Compare with previous {label.lower()}",
+                    callback_data=f"compare_{period_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🌏 Geo Stats for This Period",
+                    callback_data=f"geo_period_{period_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📅 Select another period", callback_data="stats_menu"
+                )
+            ],
+        ]
+    )
+
+    text = f"Bans in the last {label.lower()}:\n\nTotal: {current}\nPeriod: {label}"
+
+    try:
+        if plot_path and Path(plot_path).exists():
+            photo = FSInputFile(str(plot_path))
+            await bot.send_photo(
                 chat_id=CHAT_ID,
-                text=f"📦 GeoIP Update\n\n{text}",
+                photo=photo,
+                caption=text,
+                reply_markup=reply_markup,
                 message_thread_id=THREAD_ID,
             )
-        logger.info("Sent GeoIP update notification to Telegram.")
+            await safe_delete_message(query)
+        else:
+            raise FileNotFoundError(f"Plot not found: {plot_path}")
     except Exception as e:
-        logger.error(f"Failed to send Telegram alert: {e}")
+        logger.error(f"Failed to send stats with plot: {e}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"{text}\n\nCould not generate plot.",
+            reply_markup=reply_markup,
+            message_thread_id=THREAD_ID,
+        )
+
+
+async def compare_callback(query: CallbackQuery, bot: Bot):
+    logger = logging.getLogger(__name__)
+    await query.answer()
+
+    if not query.data or not query.data.startswith("compare_"):
+        return
+
+    period_key = query.data.replace("compare_", "")
+    if period_key not in PERIODS:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Invalid period.",
+            message_thread_id=THREAD_ID,
+        )
+        return
+
+    hours, label = PERIODS[period_key]
+    logger.info(f"User requested comparison for: {label}")
+    current = count_bans_in_period(hours)
+    prev = count_bans_in_period(2 * hours) - count_bans_in_period(hours)
+
+    text = f"📊 Comparison: {label} vs Previous {label}\n\n"
+    text += f"📌 Current: {current}\n"
+    text += f"📌 Previous: {prev}\n"
+    diff = current - prev
+    trend = "↗️" if diff > 0 else "↘️" if diff < 0 else "➡️"
+    change = abs(diff)
+    if prev == 0:
+        percent = 0.0 if current == 0 else 100.0
+    else:
+        percent = (change / prev) * 100
+    text += f"📈 Change: {trend} {change} ({percent:.1f}%)\n"
+
+    plot_path = generate_comparison_plot(current, prev, label)
+    reply_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 Select another period", callback_data="stats_menu"
+                )
+            ]
+        ]
+    )
+
+    try:
+        if plot_path and Path(plot_path).exists():
+            photo = FSInputFile(str(plot_path))
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=photo,
+                caption=text,
+                reply_markup=reply_markup,
+                message_thread_id=THREAD_ID,
+            )
+            await safe_delete_message(query)
+        else:
+            raise FileNotFoundError(f"Comparison plot not found: {plot_path}")
+    except Exception as e:
+        logger.error(f"Failed to send comparison: {e}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=text,
+            reply_markup=reply_markup,
+            message_thread_id=THREAD_ID,
+        )
+
+
+async def geo_for_period_callback(query: CallbackQuery, bot: Bot):
+    logger = logging.getLogger(__name__)
+    await query.answer()
+
+    if not query.data or not query.data.startswith("geo_period_"):
+        return
+
+    period_key = query.data.replace("geo_period_", "")
+    if period_key not in PERIODS:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Invalid period.",
+            message_thread_id=THREAD_ID,
+        )
+        return
+
+    hours, label = PERIODS[period_key]
+    logger.info(f"User requested geo stats for period: {label} ({hours}h)")
+
+    ips = extract_banned_ips(since_hours=hours)
+    if not ips:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"No banned IPs found in the last {label.lower()}.",
+            message_thread_id=THREAD_ID,
+        )
+        return
+
+    map_plot = generate_world_map_plot(
+        ips, f"Global Distribution of Banned IPs — Last {label.lower()}"
+    )
+    if map_plot and Path(map_plot).exists():
+        photo = FSInputFile(str(map_plot))
+        await bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=photo,
+            caption=f"🌍 Geographic distribution — Last {label.lower()}",
+            message_thread_id=THREAD_ID,
+        )
+    else:
+        logger.error(f"Map file not found: {map_plot}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="Failed to generate world map.",
+            message_thread_id=THREAD_ID,
+        )
+
+    reply_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Periods", callback_data="stats_menu")]
+        ]
+    )
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="📅 Select another period:",
+        reply_markup=reply_markup,
+        message_thread_id=THREAD_ID,
+    )
+
+    await safe_delete_message(query)
+
+
+async def error_handler(event, bot: Bot):
+    """
+    Universal error handler for aiogram v3.
+    `event` may contain .exception and .update (if any).
+    """
+    logger = logging.getLogger(__name__)
+    exc = getattr(event, "exception", None)
+    logger.error(f"Exception while handling update: {exc}", exc_info=exc)
+
+    error_text = "⚠️ Bot error"
+    if exc:
+        error_text = f"⚠️ Bot error: {type(exc).__name__}\nMessage: {exc}"
+
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=error_text)
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
 
 
 # === Main ===
-async def main() -> None:
-    # Cleaning up old charts
+async def on_startup(bot: Bot):
+    logger = logging.getLogger(__name__)
+    # Clean old charts
     for plot_file in TMP_DIR.glob("fail2ban_*.png"):
         try:
             os.unlink(plot_file)
         except Exception as e:
-            logger = logging.getLogger(__name__)
             logger.warning(f"Failed to remove old plot {plot_file}: {e}")
 
-    setup_logging(LOG_LEVEL)
-    logger = logging.getLogger(__name__)
-    logger.info("--------------------------------------------------------")
-    logger.info("Starting fail2ban Telegram bot...")
-    logger.info("--------------------------------------------------------")
+    # Initial GeoIP update (optional, runs once at startup)
+    await update_geoip_db(bot)
+    logger.info("Bot is running. Awaiting updates...")
 
-    # ✅ Update GeoIP DB on startup
-    await update_geoip_db()
 
-    bot = CustomExtBot(token=BOT_TOKEN, retries=5, retry_delay=2)
+def register_routes(dp: Dispatcher):
+    # Commands
+    dp.message.register(start, Command("start"))
+    dp.message.register(stats_command, Command("stats"))
+    dp.message.register(status_command, Command("status"))
+    dp.message.register(geo_command, Command("geo"))
 
-    app = ApplicationBuilder().bot(bot).build()
-    app.add_error_handler(error_handler)
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("geo", geo_command))
-    app.add_handler(CallbackQueryHandler(button_callback, pattern="^period_"))
-    app.add_handler(CallbackQueryHandler(compare_callback, pattern="^compare_"))
-    app.add_handler(CallbackQueryHandler(stats_menu_callback, pattern="^stats_menu$"))
-    app.add_handler(
-        CallbackQueryHandler(geo_for_period_callback, pattern="^geo_period_")
+    # Callbacks
+    dp.callback_query.register(button_callback, F.data.startswith("period_"))
+    dp.callback_query.register(compare_callback, F.data.startswith("compare_"))
+    dp.callback_query.register(stats_menu_callback, F.data == "stats_menu")
+    dp.callback_query.register(
+        geo_for_period_callback, F.data.startswith("geo_period_")
     )
 
-    logger.info("Bot is running. Awaiting updates...")
-    await app.run_polling()
+    # Errors
+    dp.errors.register(error_handler)
+
+
+async def main():
+    setup_logging(LOG_LEVEL)
+    logger = logging.getLogger(__name__)
+    logger.info("=== Starting fail2ban Telegram bot (aiogram v3.22) ... ===")
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+    dp = Dispatcher()
+
+    register_routes(dp)
+    dp.startup.register(on_startup)
+
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("=== Bot stopped by user ===")
+    finally:
+        await bot.session.close()
+        logger.info("=== Shutdown complete ===")
 
 
 if __name__ == "__main__":
