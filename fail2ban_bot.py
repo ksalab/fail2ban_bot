@@ -42,6 +42,9 @@ from aiogram.types import (
     FSInputFile,
 )
 
+# module-level variables
+db_manager = None  # type: Optional[object]
+
 # === Load config ===
 load_dotenv()
 
@@ -221,23 +224,45 @@ def parse_log_timestamp(log_line: str) -> Optional[datetime]:
 
 def extract_banned_ips(since_hours: int = None) -> List[str]:
     """
-    Extract unique banned IP addresses from fail2ban log.
-
-    Args:
-        since_hours (int, optional): If set, only include bans within the last N hours.
-
-    Returns:
-        List[str]: List of unique banned IP addresses.
+    Extract unique banned IP addresses either from DB (preferred) or from fail2ban log.
+    Preserve order (newest last) and support optional time window.
     """
     logger = logging.getLogger(__name__)
+
+    # If DB available, use it (more reliable, faster after sync)
+    if db_manager:
+        since_dt = None
+        if since_hours:
+            since_dt = datetime.now() - timedelta(hours=since_hours)
+        rows = db_manager.fetch_bans(since=since_dt)
+        # rows: (ts, ip, jail, action, reason, country, city, raw_line)
+        ips = []
+        for r in rows:
+            ip = r[1]
+            # include only bans (ignore unban records if any)
+            action = (r[3] or "").lower()
+            if "ban" in action:
+                ips.append(ip)
+        # preserve order and de-duplicate while preserving first occurrence
+        seen = set()
+        ordered = []
+        for ip in ips:
+            if ip not in seen:
+                seen.add(ip)
+                ordered.append(ip)
+        return ordered
+
+    # Fallback: parse log file (original behavior), but preserve order
     ips = []
     now = datetime.now()
+    cutoff = None
     if since_hours:
         cutoff = now - timedelta(hours=since_hours)
     try:
         with open(LOG_FILE_PATH, "r") as f:
             for line in f:
-                if "Ban " not in line:
+                # support both "Ban" and "ban"
+                if "Ban " not in line and "ban " not in line:
                     continue
                 m = re.search(
                     r"Ban ([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)", line
@@ -246,40 +271,53 @@ def extract_banned_ips(since_hours: int = None) -> List[str]:
                     continue
                 ip = m.group(1)
                 ts = parse_log_timestamp(line)
-                if since_hours and ts and ts < cutoff:
+                if cutoff and ts and ts < cutoff:
                     continue
                 ips.append(ip)
     except Exception as e:
         logger.error(f"Error reading banned IPs: {e}")
-    return list(set(ips))
+    # remove duplicates but preserve order
+    seen = set()
+    ordered_ips = []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            ordered_ips.append(ip)
+    return ordered_ips
 
 
 def count_bans_in_period(hours: int) -> int:
     """
-    Count the number of bans in the last given hours.
-
-    Args:
-        hours (int): Number of hours to look back.
-
-    Returns:
-        int: Number of bans in the period.
+    Count number of 'Ban' actions in the last `hours` hours.
+    Prefer DB if available; fallback to log parsing.
     """
     logger = logging.getLogger(__name__)
+
+    if db_manager:
+        since_dt = datetime.now() - timedelta(hours=hours)
+        rows = db_manager.fetch_bans(since=since_dt)
+        # rows: (ts, ip, jail, action, reason, country, city, raw_line)
+        count = sum(1 for r in rows if r[3] and "ban" in r[3].lower())
+        logger.info(f"Counted {count} bans in last {hours} hours (from DB)")
+        return count
+
+    # Fallback to file parsing (original behavior but slightly optimized)
     now = datetime.now()
     cutoff = now - timedelta(hours=hours)
     count = 0
     try:
+        # read file once and iterate reversed
         with open(LOG_FILE_PATH, "r") as f:
             lines = f.readlines()
         for line in reversed(lines):
-            if "Ban" not in line:
+            if "Ban" not in line and "ban" not in line:
                 continue
             ts = parse_log_timestamp(line)
             if ts is None:
                 continue
-            if ts and ts >= cutoff:
+            if ts >= cutoff:
                 count += 1
-            elif ts and ts < cutoff:
+            elif ts < cutoff:
                 break
     except Exception as e:
         logger.error(f"Error reading log file {LOG_FILE_PATH}: {e}")
@@ -566,7 +604,85 @@ def get_period_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# === Alerts / DB update (adapted to aiogram: use bot directly) ===
+# === Database Manager ===
+async def sync_log_to_db_once():
+    """
+    One-time synchronization: scan fail2ban log and insert new ban records into DB.
+    Uses DBManager.ban_exists to avoid duplicates.
+    """
+    global db_manager
+    logger = logging.getLogger(__name__)
+    if not db_manager:
+        logger.info("DBManager not available; skipping log sync.")
+        return
+
+    try:
+        with open(LOG_FILE_PATH, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.error(f"Failed to read log file for sync: {e}")
+        return
+
+    inserted = 0
+    for line in lines:
+        # find action and ip
+        action = None
+        if "Ban " in line or " ban " in line:
+            action = "Ban"
+        elif "Unban " in line or " unban " in line:
+            action = "Unban"
+        else:
+            continue
+
+        m_ip = re.search(
+            r"(?:Ban|Unban) ([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)", line
+        )
+        if not m_ip:
+            continue
+        ip = m_ip.group(1)
+
+        ts = parse_log_timestamp(line)
+        if ts is None:
+            ts = datetime.now()
+
+        # try to extract jail name like "[sshd]" in the line
+        m_jail = re.search(r"\[([^\]]+)\].*?(?:Ban|Unban)", line)
+        jail = m_jail.group(1) if m_jail else None
+
+        # deduplicate by exact ts and ip
+        if db_manager.ban_exists(ts, ip):
+            continue
+
+        geo = get_geo_info(ip)
+        try:
+            db_manager.insert_ban(
+                ip=ip,
+                jail=jail,
+                action=action,
+                reason=None,
+                country=geo.get("country"),
+                city=geo.get("city"),
+                raw_line=line.strip(),
+                ts=ts,
+            )
+            inserted += 1
+        except Exception as e:
+            logger.error(f"Failed to insert ban into DB for {ip}: {e}")
+
+    logger.info(f"Log sync completed. Inserted {inserted} new ban(s).")
+
+
+async def periodic_log_sync(interval_seconds: int = 300):
+    """Background periodic synchronization task. Runs forever."""
+    while True:
+        try:
+            await sync_log_to_db_once()
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Periodic sync error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
+# === Alerts / GEO DB update (adapted to aiogram: use bot directly) ===
 async def _send_telegram_alert(bot: Bot, text: str) -> None:
     logger = logging.getLogger(__name__)
     try:
@@ -629,6 +745,8 @@ async def update_geoip_db(bot: Bot | None = None) -> None:
             await _send_telegram_alert(bot, error_msg + "\nPlease check .env file.")
         return
 
+    # https://download.maxmind.com/app/geoip_download_by_token?date=20250912&edition_id=GeoLite2-City&suffix=tar.gz&token=v2.local.YTp3V5HagdJq4MQlxiYZgH59E73uBDONJrHaUIdD6snj3KO25dI8uiJWFdqNKZ5Idn_ks97FlXH6ohLADUhqz9F3WTdOnJFv3WgJ_cRGtxKdqRT2D_MFuoP3_f9Zo1rBVg9zrlXW_G18tTloOmZ1-yDdWO1DTzr8S94S9LPUj1SX5mXlJBr3ST5OHCeG3ilJJcVmr9U
+    # https://download.maxmind.com/geoip/databases/GeoLite2-City/download?suffix=tar.gz
     url = (
         f"https://download.maxmind.com/app/geoip_download"
         f"?edition_id=GeoLite2-City"
@@ -696,7 +814,8 @@ async def update_geoip_db(bot: Bot | None = None) -> None:
 
 
 # === Handlers (aiogram) ===
-async def start(message: Message, bot: Bot):
+async def start(message: Message):
+    bot = message.bot
     logger = logging.getLogger(__name__)
     user_id = message.from_user.id if message.from_user else 0
     if not is_user_admin(user_id):
@@ -717,7 +836,8 @@ async def start(message: Message, bot: Bot):
     )
 
 
-async def stats_command(message: Message, bot: Bot):
+async def stats_command(message: Message):
+    bot = message.bot
     logger = logging.getLogger(__name__)
     user_id = message.from_user.id if message.from_user else 0
     if not is_user_admin(user_id):
@@ -732,7 +852,8 @@ async def stats_command(message: Message, bot: Bot):
     )
 
 
-async def status_command(message: Message, bot: Bot):
+async def status_command(message: Message):
+    bot = message.bot
     logger = logging.getLogger(__name__)
     user_id = message.from_user.id if message.from_user else 0
     if not is_user_admin(user_id):
@@ -772,7 +893,8 @@ async def status_command(message: Message, bot: Bot):
     logger.info("Sent service status to chat")
 
 
-async def geo_command(message: Message, bot: Bot):
+async def geo_command(message: Message):
+    bot = message.bot
     logger = logging.getLogger(__name__)
     user_id = message.from_user.id if message.from_user else 0
     if not is_user_admin(user_id):
@@ -822,7 +944,8 @@ async def geo_command(message: Message, bot: Bot):
     )
 
 
-async def stats_menu_callback(query: CallbackQuery, bot: Bot):
+async def stats_menu_callback(query: CallbackQuery):
+    bot = query.bot
     logger = logging.getLogger(__name__)
     await query.answer()
     logger.info("User opened period selection menu")
@@ -843,7 +966,8 @@ async def stats_menu_callback(query: CallbackQuery, bot: Bot):
         )
 
 
-async def button_callback(query: CallbackQuery, bot: Bot):
+async def button_callback(query: CallbackQuery):
+    bot = query.bot
     logger = logging.getLogger(__name__)
     await query.answer()
 
@@ -911,7 +1035,8 @@ async def button_callback(query: CallbackQuery, bot: Bot):
         )
 
 
-async def compare_callback(query: CallbackQuery, bot: Bot):
+async def compare_callback(query: CallbackQuery):
+    bot = query.bot
     logger = logging.getLogger(__name__)
     await query.answer()
 
@@ -978,7 +1103,8 @@ async def compare_callback(query: CallbackQuery, bot: Bot):
         )
 
 
-async def geo_for_period_callback(query: CallbackQuery, bot: Bot):
+async def geo_for_period_callback(query: CallbackQuery):
+    bot = query.bot
     logger = logging.getLogger(__name__)
     await query.answer()
 
@@ -1062,13 +1188,39 @@ async def error_handler(event, bot: Bot):
 
 # === Main ===
 async def on_startup(bot: Bot):
+    """Startup: clean charts, init DBManager (if available), update GeoIP and sync logs."""
+    global db_manager
     logger = logging.getLogger(__name__)
+
     # Clean old charts
     for plot_file in TMP_DIR.glob("fail2ban_*.png"):
         try:
             os.unlink(plot_file)
         except Exception as e:
             logger.warning(f"Failed to remove old plot {plot_file}: {e}")
+
+    # Try to initialize DBManager from a few common module names
+    _DBClass = None
+    try:
+        from db_manager import DBManager as _DBClass  # try package named `db`
+    except Exception:
+        try:
+            from db_manager import DBManager as _DBClass  # try file db_manager.py
+        except Exception:
+            _DBClass = None
+
+    if _DBClass:
+        try:
+            db_manager = _DBClass()
+            logger.info("🗄 DBManager initialized successfully.")
+            # initial one-time sync
+            await sync_log_to_db_once()
+            # periodic background sync (do not await)
+            asyncio.create_task(periodic_log_sync())
+        except Exception as e:
+            logger.error(f"Failed to initialize DBManager: {e}")
+    else:
+        logger.info("DBManager module not found; DB features disabled.")
 
     # Initial GeoIP update (optional, runs once at startup)
     await update_geoip_db(bot)
