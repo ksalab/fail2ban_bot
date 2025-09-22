@@ -44,27 +44,23 @@ cd fail2ban_bot
 
 ### 2. Create .env
 
-```env
-BOT_TOKEN=your:bot_token
-ADMINS=123456789,987654321
-CHAT_ID=-1001234567890
-MESSAGE_THREAD_ID=123  # Optional
-LOG_FILE=/var/log/fail2ban.log
-GEOIP_DB_PATH=./geoip/GeoLite2-City.mmdb
-MAXMIND_ACCOUNT_ID=123456
-MAXMIND_LICENSE_KEY=your_license_key_here
-LOG_LEVEL=INFO
+```bash
+cp example.env .env
 ```
 
-### 3. Run with Docker
+### 3. Build docker image
 
 ```bash
 docker build -t fail2ban-bot .
-docker run -d \
-  --name fail2ban-bot \
-  --restart unless-stopped \
-  -v $(pwd)/geoip:/app/geoip \
+```
+
+### 4. Run with Docker
+
+```bash
+docker run -d --name fail2ban-bot \
   -v /var/log/fail2ban.log:/var/log/fail2ban.log:ro \
+  -v ./geoip:/app/geoip:rw \
+  --restart unless-stopped \
   --env-file .env \
   fail2ban-bot
 ```
