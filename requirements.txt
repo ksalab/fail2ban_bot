@@ -1,8 +1,0 @@
-python-telegram-bot==20.6
-python-dotenv
-geoip2
-pandas
-matplotlib
-geopandas
-cartopy
-Shapely

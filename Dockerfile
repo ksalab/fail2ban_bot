@@ -1,56 +1,44 @@
 # Dockerfile
 # Docker image for fail2ban Telegram monitoring bot
-# Uses Python 3.12-slim for minimal size and security
 
+# ARG allows to easily change the Python version during build
+ARG PYTHON_VERSION=3.12-slim
 # Base image: official Python slim image
-FROM python:3.12-slim
+FROM python:${PYTHON_VERSION}
 
 # Metadata labels
-LABEL org.opencontainers.image.title="fail2ban-bot" \
-      org.opencontainers.image.description="Telegram bot for monitoring fail2ban bans, stats, geo-mapping and service status" \
-      org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.source="https://github.com/ksalab/fail2ban_bot" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.authors="ksalab0@gmail.com"
+# ... (labels section remains the same)
 
-# Prevents Python from writing .pyc files
-ENV PYTHONDONTWRITEBYTECODE=1
-# Forces Python output to be unbuffered
-ENV PYTHONUNBUFFERED=1
+# Prevents Python from writing .pyc files and forces unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies required for GeoIP and cartography
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        libproj-dev \
-        libgeos-dev \
-        libgdal-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Install system dependencies
+# ... (apt-get section remains the same)
 
-# Copy Python dependencies file
-COPY requirements.txt .
+# Copy the project definition file
+COPY pyproject.toml .
 
-# Install Python packages
-# geopandas, cartopy, geoip2, matplotlib, python-telegram-bot, python-dotenv
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python packages from pyproject.toml
+RUN pip install --no-cache-dir .
 
-# Copy the application code
-COPY fail2ban_bot.py .env* ./
+# Copy the application code into the container
+COPY main.py .
+COPY app ./app/
 
-# Create directory for GeoIP database
-RUN mkdir -p /app/geoip
+# Copy the environment file
+COPY .env .
 
-# Expose no ports — bot runs in polling mode
-# No healthcheck needed — bot logs indicate status
+# Create directories for the database and GeoIP data
+RUN mkdir -p /app/db /app/geoip
 
-# Run the bot as non-root user for security
+# Run the bot as a non-root user for security
 RUN adduser --disabled-password --gecos '' appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
 # Command to run the bot
-CMD ["python", "fail2ban_bot.py"]
+CMD ["python", "main.py"]

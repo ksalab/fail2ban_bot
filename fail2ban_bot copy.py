@@ -1202,10 +1202,10 @@ async def on_startup(bot: Bot):
     # Try to initialize DBManager from a few common module names
     _DBClass = None
     try:
-        from db_manager import DBManager as _DBClass  # try package named `db`
+        from app.db_manager import DBManager as _DBClass  # try package named `db`
     except Exception:
         try:
-            from db_manager import DBManager as _DBClass  # try file db_manager.py
+            from app.db_manager import DBManager as _DBClass  # try file db_manager.py
         except Exception:
             _DBClass = None
 
